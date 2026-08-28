@@ -1,0 +1,62 @@
+#!/bin/bash
+
+TARGET="192.168.146.1"
+INTERVAL=30
+PING_TIMEOUT=3
+
+LOCK="/tmp/vpn_keepalive.lock"
+LOG="/var/log/vpn_keepalive.log"
+LOG_MAX_KB=10240
+
+if [ -f "$LOCK" ]; then
+    OLD=$(cat "$LOCK" 2>/dev/null)
+    if [ -n "$OLD" ] && kill -0 "$OLD" 2>/dev/null; then
+        exit 0
+    fi
+fi
+
+echo $$ > "$LOCK"
+
+cleanup() {
+    rm -f "$LOCK"
+    exit
+}
+
+trap cleanup INT TERM EXIT
+
+get_src() {
+    ip -4 -o addr show 2>/dev/null |
+        awk '{print $4}' |
+        cut -d/ -f1 |
+        grep -E '^10\.' |
+        head -1
+}
+
+rotate_log() {
+    [ -f "$LOG" ] || return
+
+    local kb
+    kb=$(du -k "$LOG" 2>/dev/null | cut -f1)
+
+    if [ "${kb:-0}" -gt "$LOG_MAX_KB" ]; then
+        mv "$LOG" "${LOG}.old"
+    fi
+}
+
+while true; do
+    SRC=$(get_src)
+    TS=$(date '+%F %T')
+
+    if [ -z "$SRC" ]; then
+        echo "$TS ERR  src=unknown (no 10.x.x.x interface)" >> "$LOG"
+
+    elif ping -c1 -W"$PING_TIMEOUT" -I "$SRC" "$TARGET" >/dev/null 2>&1; then
+        echo "$TS OK   $TARGET <- $SRC" >> "$LOG"
+
+    else
+        echo "$TS FAIL $TARGET <- $SRC" >> "$LOG"
+    fi
+
+    rotate_log
+    sleep "$INTERVAL"
+done

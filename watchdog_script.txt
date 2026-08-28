@@ -1,0 +1,12 @@
+#!/bin/bash
+
+SCRIPT="/flash/scripts/vpn_keepalive.sh"
+CHECK_INTERVAL=60
+
+while true; do
+    if ! pgrep -f "$SCRIPT" >/dev/null 2>&1; then
+        nohup "$SCRIPT" >/dev/null 2>&1 &
+    fi
+
+    sleep "$CHECK_INTERVAL"
+done
