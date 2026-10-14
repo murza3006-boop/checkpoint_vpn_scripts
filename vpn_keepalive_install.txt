@@ -1,0 +1,306 @@
+#!/bin/bash
+# =============================================================================
+#  VPN Keepalive + SA Recovery для Check Point 1500-серии (1535, Gaia Embedded)
+# =============================================================================
+#  Что делает:
+#    * держит IPsec-туннель живым, пингуя хост за туннелем;
+#    * при N неудачах подряд удаляет IKE/IPsec SA конкретного peer (vpn tu del),
+#      с cooldown, чтобы не рвать туннель слишком часто;
+#    * сам себя защищает от второй копии, переживает перезагрузку
+#      (userScript) и умирает/воскресает через cron-страховку;
+#    * пишет в лог только изменения состояния + редкий heartbeat.
+#
+#  В репозитории НЕТ ни внешнего IP, ни внутренних адресов.
+#  Они задаются при установке и лежат только на устройстве:
+#      /flash/scripts/vpn_keepalive.conf   (права 600)
+#
+#  Установка (expert mode, от root):
+#      wget -O vpn_keepalive_install.sh <URL>
+#      bash vpn_keepalive_install.sh                       # спросит адреса
+#      bash vpn_keepalive_install.sh PEER_IP TARGET_IP     # или аргументами
+#      VPN_PEER=x.x.x.x TARGET=y.y.y.y bash vpn_keepalive_install.sh
+#
+#  Прочее:
+#      bash vpn_keepalive_install.sh --status
+#      bash vpn_keepalive_install.sh --uninstall
+#
+#  Повторный запуск без аргументов обновляет скрипт, не трогая конфиг.
+#  Повторный запуск с адресами меняет только VPN_PEER/TARGET в конфиге.
+# =============================================================================
+
+DIR="/flash/scripts"
+SCRIPT="$DIR/vpn_keepalive.sh"
+CONF="$DIR/vpn_keepalive.conf"
+USERSCRIPT="/pfrm2.0/etc/userScript"
+BOOT_LINE="nohup $SCRIPT >/dev/null 2>&1 &"
+CRON_LINE="* * * * * $SCRIPT >/dev/null 2>&1"
+LOG="/var/log/vpn_keepalive.log"
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+info() { echo "[*] $*"; }
+
+valid_ip() {
+    echo "$1" | awk -F. 'NF==4 { for (i=1;i<=4;i++) if ($i !~ /^[0-9]+$/ || $i+0 > 255) exit 1; exit 0 } { exit 1 }'
+}
+
+usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+# --- остановка старых процессов (watchdog первым, иначе он перезапустит keepalive)
+stop_all() {
+    for p in $(ps aux 2>/dev/null | grep '[v]pn_watchdog\.sh' | awk '{print $2}'); do
+        [ "$p" != "$$" ] && [ "$p" != "$PPID" ] && kill "$p" 2>/dev/null
+    done
+    sleep 1
+    for p in $(ps aux 2>/dev/null | grep '[v]pn_keepalive\.sh' | awk '{print $2}'); do
+        [ "$p" != "$$" ] && [ "$p" != "$PPID" ] && kill "$p" 2>/dev/null
+    done
+    sleep 1
+    rm -f /tmp/vpn_keepalive.lock /tmp/vpn_keepalive.pid
+}
+
+# --- cron и userScript
+clean_cron() {
+    (crontab -l 2>/dev/null | grep -v 'vpn_keepalive\.sh' | grep -v 'vpn_watchdog\.sh' | grep -v 'vpn_start\.sh') | crontab - 2>/dev/null
+}
+clean_userscript() {
+    [ -f "$USERSCRIPT" ] && sed -i -e '/vpn_keepalive\.sh/d' -e '/vpn_watchdog\.sh/d' -e '/vpn_start\.sh/d' "$USERSCRIPT"
+}
+
+case "$1" in
+    -h|--help) usage ;;
+    --status)
+        echo "--- процессы";   ps aux | grep '[v]pn_keepalive\.sh' || echo "не запущен"
+        echo "--- cron";       crontab -l 2>/dev/null | grep vpn_ || echo "нет записи"
+        echo "--- userScript"; grep vpn_ "$USERSCRIPT" 2>/dev/null || echo "нет записи"
+        echo "--- конфиг";     [ -f "$CONF" ] && sed -e 's/^\(VPN_PEER=\).*/\1<скрыто>/' -e 's/^\(TARGET=\).*/\1<скрыто>/' "$CONF" | grep -E '^[A-Z_]+=' || echo "нет конфига"
+        echo "--- лог";        tail -15 "$LOG" 2>/dev/null || echo "лога нет"
+        exit 0 ;;
+    --uninstall)
+        info "Остановка и удаление"
+        stop_all; clean_cron; clean_userscript
+        rm -f "$SCRIPT" "$CONF" /tmp/vpn_keepalive.pid /tmp/vpn_keepalive.lock
+        info "Готово (лог $LOG оставлен)"
+        exit 0 ;;
+esac
+
+[ "$(id -u)" = "0" ] || die "нужен root (expert mode)"
+
+# --- адреса: аргументы > переменные окружения > существующий конфиг > вопрос
+PEER="${1:-$VPN_PEER}"
+TGT="${2:-$TARGET}"
+
+old_val() { [ -f "$CONF" ] && ( . "$CONF" 2>/dev/null; eval "echo \"\$$1\"" ); }
+[ -z "$PEER" ] && PEER=$(old_val VPN_PEER)
+[ -z "$TGT" ]  && TGT=$(old_val TARGET)
+
+if [ -t 0 ]; then
+    [ -z "$PEER" ] && { printf "Внешний IP VPN peer (удалённый шлюз): "; read -r PEER; }
+    [ -z "$TGT" ]  && { printf "IP хоста за туннелем (для проверки пингом): "; read -r TGT; }
+fi
+
+valid_ip "$PEER" || die "VPN peer не задан или неверный IP. Пример: bash $0 PEER_IP TARGET_IP"
+valid_ip "$TGT"  || die "TARGET не задан или неверный IP. Пример: bash $0 PEER_IP TARGET_IP"
+
+# --- 1. останавливаем старое
+info "Останавливаю старые процессы"
+stop_all
+
+# --- 2. основной скрипт
+info "Пишу $SCRIPT"
+mkdir -p "$DIR"
+cat > "$SCRIPT" << 'EOF'
+#!/bin/bash
+# vpn_keepalive.sh — keepalive + восстановление SA для Check Point 1500.
+# Настройки: /flash/scripts/vpn_keepalive.conf (создаёт установщик).
+
+VERSION="2.0"
+export PATH="$PATH:/sbin:/usr/sbin:/bin:/usr/bin:/pfrm2.0/bin:/pfrm2.0/sbin"
+
+CONF="${VPN_KEEPALIVE_CONF:-/flash/scripts/vpn_keepalive.conf}"
+
+# ---- значения по умолчанию (переопределяются в конфиге)
+VPN_PEER=""                 # внешний IP удалённого шлюза (peer)
+TARGET=""                   # хост за туннелем, который пингуем
+SRC_IP=""                   # явный source IP для пинга; пусто = автоопределение
+SRC_REGEX='^10\.'           # какой локальный IP брать при автоопределении
+INTERVAL=30                 # пауза между проверками, сек
+PING_TIMEOUT=3              # таймаут одного пинга, сек
+FAIL_THRESHOLD=3            # сколько провалов подряд = проблема
+SA_DELETE_COOLDOWN=600      # не чаще, чем раз в N сек удалять SA
+LOG_OK_EVERY=20             # heartbeat в лог раз в N успешных проверок (0 = выкл)
+LOG="/var/log/vpn_keepalive.log"
+LOG_MAX_KB=2048             # ротация лога
+PIDFILE="/tmp/vpn_keepalive.pid"
+USE_SYSLOG=1                # дублировать важные события в syslog (если есть logger)
+
+[ -r "$CONF" ] && . "$CONF"
+
+log() {
+    echo "$(date '+%F %T') $*" >> "$LOG"
+}
+event() {   # важное событие: лог + syslog
+    log "$*"
+    [ "$USE_SYSLOG" = "1" ] && command -v logger >/dev/null 2>&1 && logger -t vpn_keepalive "$*"
+}
+
+# ---- проверка настроек
+if [ -z "$VPN_PEER" ] || [ -z "$TARGET" ]; then
+    log "FATAL VPN_PEER/TARGET не заданы в $CONF"
+    exit 1
+fi
+
+# ---- одна копия. Проверяем не только «PID жив», но и что это именно наш скрипт
+if [ -f "$PIDFILE" ]; then
+    OLD=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -n "$OLD" ] && [ "$OLD" != "$$" ] && kill -0 "$OLD" 2>/dev/null; then
+        if tr '\0' ' ' < "/proc/$OLD/cmdline" 2>/dev/null | grep -q vpn_keepalive; then
+            exit 0
+        fi
+    fi
+fi
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT
+trap 'exit 0' INT TERM
+
+get_src() {
+    if [ -n "$SRC_IP" ]; then echo "$SRC_IP"; return; fi
+    ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -E "$SRC_REGEX" | head -1
+}
+
+rotate_log() {
+    [ -f "$LOG" ] || return
+    local kb
+    kb=$(du -k "$LOG" 2>/dev/null | cut -f1)
+    [ "${kb:-0}" -gt "$LOG_MAX_KB" ] && mv "$LOG" "${LOG}.old"
+}
+
+# RTT последней успешной проверки (мс), пусто если нет
+LAST_RTT=""
+check() {   # $1 = source IP
+    local out
+    out=$(ping -c1 -W"$PING_TIMEOUT" -I "$1" "$TARGET" 2>&1) || return 1
+    LAST_RTT=$(echo "$out" | sed -n 's/.*time[=<]\([0-9.]*\).*/\1/p' | head -1)
+    return 0
+}
+
+recover() {
+    event "RECOVERY удаляю IKE/IPsec SA для peer (vpn tu del)"
+    if command -v vpn >/dev/null 2>&1; then
+        vpn tu del "$VPN_PEER" >> "$LOG" 2>&1
+        event "RECOVERY vpn tu del rc=$?"
+    else
+        event "RECOVERY команда vpn не найдена в PATH ($PATH)"
+        return 1
+    fi
+    # Пинги прямо сейчас инициируют новое согласование туннеля,
+    # не ждём следующего цикла
+    ping -c3 -W2 -I "$1" "$TARGET" >/dev/null 2>&1
+}
+
+# ---- состояние
+STATE="unknown"        # unknown | up | down
+FAIL_COUNT=0
+OK_COUNT=0
+DOWN_SINCE=0
+LAST_SA_DELETE=0
+RECOVERIES=0
+
+event "START v$VERSION pid=$$ interval=${INTERVAL}s threshold=$FAIL_THRESHOLD cooldown=${SA_DELETE_COOLDOWN}s"
+
+while true; do
+    SRC=$(get_src)
+    NOW=$(date +%s)
+
+    if [ -z "$SRC" ]; then
+        # нет подходящего интерфейса: это не проблема туннеля, SA не трогаем
+        log "ERR  нет локального IP по маске $SRC_REGEX (задайте SRC_IP в конфиге)"
+        FAIL_COUNT=0
+
+    elif check "$SRC"; then
+        OK_COUNT=$((OK_COUNT + 1))
+        if [ "$STATE" = "down" ]; then
+            event "UP   туннель восстановлен, простой $((NOW - DOWN_SINCE))с, rtt=${LAST_RTT:-?}ms, восстановлений всего: $RECOVERIES"
+        elif [ "$STATE" = "unknown" ]; then
+            event "UP   $TARGET доступен через $SRC rtt=${LAST_RTT:-?}ms"
+        elif [ "$LOG_OK_EVERY" -gt 0 ] && [ $((OK_COUNT % LOG_OK_EVERY)) -eq 0 ]; then
+            log "OK   heartbeat rtt=${LAST_RTT:-?}ms проверок успешно: $OK_COUNT"
+        fi
+        STATE="up"
+        FAIL_COUNT=0
+
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        if [ "$STATE" != "down" ]; then
+            STATE="down"
+            DOWN_SINCE=$NOW
+            event "DOWN $TARGET недоступен через $SRC"
+        fi
+        log "FAIL $FAIL_COUNT/$FAIL_THRESHOLD"
+
+        if [ "$FAIL_COUNT" -ge "$FAIL_THRESHOLD" ]; then
+            if [ $((NOW - LAST_SA_DELETE)) -ge "$SA_DELETE_COOLDOWN" ]; then
+                recover "$SRC"
+                LAST_SA_DELETE=$NOW
+                RECOVERIES=$((RECOVERIES + 1))
+                FAIL_COUNT=0
+            else
+                log "RECOVERY cooldown, осталось $((SA_DELETE_COOLDOWN - (NOW - LAST_SA_DELETE)))с"
+            fi
+        fi
+    fi
+
+    rotate_log
+    sleep "$INTERVAL" &
+    wait $!
+done
+EOF
+chmod +x "$SCRIPT"
+
+# --- 3. конфиг (адреса живут только здесь)
+if [ -f "$CONF" ]; then
+    info "Обновляю адреса в существующем конфиге"
+    sed -i -e "s|^VPN_PEER=.*|VPN_PEER=\"$PEER\"|" -e "s|^TARGET=.*|TARGET=\"$TGT\"|" "$CONF"
+else
+    info "Создаю $CONF"
+    cat > "$CONF" << EOF
+# Локальные настройки VPN keepalive. НЕ публиковать.
+VPN_PEER="$PEER"            # внешний IP удалённого шлюза
+TARGET="$TGT"               # хост за туннелем
+
+#SRC_IP=""                  # явный source IP; по умолчанию первый локальный по SRC_REGEX
+#SRC_REGEX='^10\.'
+#INTERVAL=30
+#PING_TIMEOUT=3
+#FAIL_THRESHOLD=3
+#SA_DELETE_COOLDOWN=600
+#LOG_OK_EVERY=20
+#LOG_MAX_KB=2048
+#USE_SYSLOG=1
+EOF
+fi
+chmod 600 "$CONF"
+
+# --- 4. автозапуск
+clean_userscript
+if [ -d "$(dirname "$USERSCRIPT")" ]; then
+    echo "$BOOT_LINE" >> "$USERSCRIPT"
+    info "Добавлено в $USERSCRIPT (автозапуск при загрузке)"
+else
+    echo "WARN: $USERSCRIPT недоступен, автозапуск при загрузке не настроен" >&2
+fi
+
+clean_cron
+(crontab -l 2>/dev/null; echo "$CRON_LINE") | crontab -
+info "Добавлена cron-страховка (раз в минуту)"
+
+# --- 5. запуск и проверка
+nohup "$SCRIPT" >/dev/null 2>&1 &
+sleep 3
+echo
+echo "================ ПРОВЕРКА ================"
+ps aux | grep '[v]pn_keepalive\.sh' || echo "!!! процесс не найден, смотрите: tail $LOG"
+echo "--- cron:";       crontab -l | grep vpn_keepalive
+echo "--- userScript:"; grep vpn_keepalive "$USERSCRIPT" 2>/dev/null
+echo "--- лог:";        tail -5 "$LOG" 2>/dev/null
+echo "=========================================="
+info "Статус позже: bash $0 --status"
